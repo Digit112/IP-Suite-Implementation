@@ -1,0 +1,15 @@
+Reminder!!!
+
+The Ubuntu kernel will RST the strange packets being sent by this program because it doesn't recognize them! This command can be run to add a rule to DROP all outbound TCP RST packets whose source and destination both fall in the range 127.0.0.0 to 127.0.0.255, which includes RST packets sent by the program! Not an amazing solution, but it works for now.
+
+To add the rule:
+sudo iptables -I OUTPUT -d 127.0.0.0/24 -s 127.0.0.0/24 -p tcp --tcp-flags RST RST -j DROP
+
+To remove the rule:
+sudo iptables -D OUTPUT -d 127.0.0.0/24 -s 127.0.0.0/24 -p tcp --tcp-flags RST RST -j DROP
+
+This next command will remove the first rule, which should be this rule, because it is inserted,
+sudo iptables -D OUTPUT 1
+
+But check that this is the case with this first:
+sudo iptables -L
