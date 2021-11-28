@@ -21,6 +21,7 @@
 #define MIU_TCPIP_REFUSE 2
 #define MIU_TCPIP_IGNORE 3
 
+#define MIU_TCPIP_LISTEN 4 // This connection is not established but will connect to incoming SYNs.
 #define MIU_TCPIP_CLOSED 5 // This connection is not established and we are not attempting to establish it.
 #define MIU_TCPIP_FAILED_RST 6 // Same as closed, but set after a SYN is RST-ACK'd
 #define MIU_TCPIP_FAILED_TMO 7 // Same as closed, but set after a SYN is not ACK'd, and times out.
@@ -102,6 +103,9 @@ struct tcp_retrans_q {
 	// The packet and length of packet to transmit. Includes TCP/IP header.
 	uint8_t* packet;
 	unsigned int packet_n;
+	
+	// The sequence number of the last octet in this message. If SND_UNA > last_oc, this segment is fully acknowledged.
+	uint32_t last_oc;
 	
 	time_t retransmit_time; // Time that, when reached, this message will be retransmitted if it is on the queue.
 };
@@ -272,6 +276,9 @@ int tcp_create_connection(struct tcp_stack* stck, const char* locl_ipv4, uint32_
 	
 	new_tcb->IRS = 0;
 	
+	new_tcb->locl_has_sent_fin = 0;
+	new_tcb->locl_fin_SEQ = 0;
+	
 	// Set the appropriate location in the stack's TCB list to point to this TCB.
 	stck->connections[new_tcb_ind] = new_tcb;
 	
@@ -285,7 +292,7 @@ int tcp_create_connection(struct tcp_stack* stck, const char* locl_ipv4, uint32_
 
 // Appends this packet to the retransmission queue. If the queue is empty, creates one.
 // This function is called automatically to queue for retransmission packets sent with tcp_send() and tcp_send_raw().
-int tcp_queue_pkt(struct tcp_stack* stck, int conn_id, uint8_t* buf, int buf_n) {
+int tcp_queue_pkt(struct tcp_stack* stck, int conn_id, uint8_t* buf, int buf_n, uint32_t last_oc) {
 	struct tcp_tcb* conn = stck->connections[conn_id];
 	
 	// malloc space for a retransmission queue entry.
@@ -302,6 +309,7 @@ int tcp_queue_pkt(struct tcp_stack* stck, int conn_id, uint8_t* buf, int buf_n) 
 	pkt_rt_q->retrans_attempts = 0;
 	pkt_rt_q->packet = rbuf;
 	pkt_rt_q->packet_n = buf_n;
+	pkt_rt_q->last_oc = last_oc;
 	pkt_rt_q->retransmit_time = time(NULL) + MIU_TCPIP_RETRANS_TIMEOUT;
 	
 	if (conn->last_retrans == NULL) {
@@ -318,7 +326,7 @@ int tcp_queue_pkt(struct tcp_stack* stck, int conn_id, uint8_t* buf, int buf_n) 
 
 // Sends buf. Function will send, copy the packet into the retransmission queue, update the TCB, and return.
 // Data in buffer will be copied and can be modified or free'd after this function call, and must include TCP/IP headers.
-int tcp_send_raw(struct tcp_stack* stck, int conn_id, uint8_t* buf, int buf_n) {
+int tcp_send_raw(struct tcp_stack* stck, int conn_id, uint8_t* buf, int buf_n, int is_retransmission) {
 	int err;
 	
 	struct tcp_tcb* conn = stck->connections[conn_id];
@@ -329,8 +337,21 @@ int tcp_send_raw(struct tcp_stack* stck, int conn_id, uint8_t* buf, int buf_n) {
 	err = sendto(conn->sok, buf, buf_n, 0, (struct sockaddr*) &(struct sockaddr_in){AF_INET, conn->peer_port, {conn->peer_ipv4}}, sizeof(struct sockaddr_in));
 	if (err == -1) return MIU_TCPIP_FAILED_TO_SEND;
 	
-	err = tcp_queue_pkt(stck, conn_id, buf, buf_n);
-	if (err != MIU_TCPIP_SUCCESS) return err;
+	struct tcp_hdr* tcp_head = (struct tcp_hdr*) (buf + (((struct ipv4_hdr*) buf)->version__IHL & 0x0F) * 4);
+	
+	int seq_size = buf_n - 40;
+	if (seq_size == 0 && tcp_head->flags & ~(MIU_TCP_ACK | MIU_TCP_RST)) {
+		seq_size = 1;
+	}
+	
+	if (seq_size > 0) {
+		err = tcp_queue_pkt(stck, conn_id, buf, buf_n, conn->SND_NXT);
+		if (err != MIU_TCPIP_SUCCESS) return err;
+	}
+	
+	if (!is_retransmission) {
+		conn->SND_NXT += seq_size;
+	}
 	
 	return MIU_TCPIP_SUCCESS;
 }
@@ -339,15 +360,26 @@ int tcp_send_raw(struct tcp_stack* stck, int conn_id, uint8_t* buf, int buf_n) {
 // If do_ack is true, the outbound packet will contain the passed ACK value.
 // The outbound packet will contain the passed seq value. Values are expected in host byte order.
 // The seq and ack values should be set based on the nature of the packet which the RST is replying to. 
-int tcp_send_rst(struct tcp_stack* stck, int conn_id, int do_ack, uint32_t seq, uint32_t ack) {
+int tcp_send_rst(struct tcp_stack* stck, int conn_id, struct ipv4_hdr* ipv4_head) {
 	struct tcp_tcb* conn = stck->connections[conn_id];
 	
+	struct tcp_hdr* tcp_head = (struct tcp_hdr*) ((uint8_t*) ipv4_head + (ipv4_head->version__IHL & 0x0F) * 4);
+	
+	uint8_t* data = (uint8_t*) tcp_head + ((tcp_head->data_offset__reserved__NS & 0xF0) >> 4) * 4;
+	int data_len = ipv4_head->total_length - (data - (uint8_t*) (ipv4_head));
+	
+	uint32_t ack;
+	uint32_t seq;
+	
 	uint8_t flags = MIU_TCP_RST;
-	if (do_ack) {
+	if (!(tcp_head->flags & MIU_TCP_ACK)) {
+		seq = 0;
 		flags |= MIU_TCP_ACK;
+		ack = ntohl(tcp_head->sequence_number) + data_len;
 	}
 	else {
 		ack = 0;
+		seq = ntohl(tcp_head->acknowledgement_number);
 	}
 	
 	uint8_t* buf = malloc(40);
@@ -370,11 +402,11 @@ int tcp_send(struct tcp_stack* stck, int conn_id, uint8_t* buf, int buf_n) {
 	memcpy(pkt_buf+40, buf, buf_n);
 	
 	// Prefix headers
-	gen_ipv4_hdr((struct ipv4_hdr*) buf, 20 + buf_n, IPPROTO_TCP, conn->locl_ipv4, conn->peer_ipv4);
-	gen_tcp_hdr((struct tcp_hdr*) (buf+20), ntohs(conn->locl_port), ntohs(conn->peer_port), MIU_TCP_ACK, conn->SND_NXT, conn->RCV_NXT, 512, conn->locl_ipv4, conn->peer_ipv4, buf_n, buf);
+	gen_ipv4_hdr((struct ipv4_hdr*) pkt_buf, 20 + buf_n, IPPROTO_TCP, conn->locl_ipv4, conn->peer_ipv4);
+	gen_tcp_hdr((struct tcp_hdr*) (pkt_buf+20), ntohs(conn->locl_port), ntohs(conn->peer_port), MIU_TCP_ACK, conn->SND_NXT, conn->RCV_NXT, 512, conn->locl_ipv4, conn->peer_ipv4, buf_n, buf);
 	
 	// Send & put on the retransmission queue.
-	int err = tcp_send_raw(stck, conn_id, pkt_buf, 40+buf_n);
+	int err = tcp_send_raw(stck, conn_id, pkt_buf, 40+buf_n, 0);
 	if (err != MIU_TCPIP_SUCCESS) return MIU_TCPIP_FAILED_TO_SEND;
 	
 	free(pkt_buf);
@@ -394,23 +426,19 @@ int tcp_connect(struct tcp_stack* stck, int conn_id) {
 	
 	struct tcp_tcb* conn = stck->connections[conn_id];
 	
-	// Create a buffer to send data from and put a TCP/IP SYN packet in it.
-	uint8_t* buf = malloc(40);
+	// Create a buffer to send data from and put a SYN packet in it.
+	uint8_t buf[40];
 	if (buf == NULL) return MIU_TCPIP_INSUFFICIENT_RESOURCES;
 	
 	gen_ipv4_hdr((struct ipv4_hdr*) buf, 20, IPPROTO_TCP, conn->locl_ipv4, conn->peer_ipv4);
 	gen_tcp_hdr((struct tcp_hdr*) (buf+20), ntohs(conn->locl_port), ntohs(conn->peer_port), MIU_TCP_SYN, conn->SND_NXT, 0, 512, conn->locl_ipv4, conn->peer_ipv4, 0, NULL);
 	
 	// Send SYN
-	err = tcp_send_raw(stck, conn_id, buf, 40);
-	if (err != MIU_TCPIP_SUCCESS) {
-		free(buf);
-		return err;
-	}
+	printf("Sending SYN.\n");
+	err = tcp_send_raw(stck, conn_id, buf, 40, 0);
+	if (err != MIU_TCPIP_SUCCESS) return err;
 	
 	conn->state = MIU_TCPIP_SYN_SENT;
-	
-	free(buf);
 	
 	return MIU_TCPIP_SUCCESS;
 }
@@ -461,6 +489,9 @@ int tcp_reset_connection(struct tcp_stack* stck, int conn_id) {
 	conn->RCV_WND = 0;
 	
 	conn->IRS = 0;
+	
+	conn->locl_has_sent_fin = 0;
+	conn->locl_fin_SEQ = 0;
 }
 
 // Retreives all packets from the receive buffer on this connection and handles them in turn.
@@ -517,7 +548,34 @@ int tcp_recv_packets(struct tcp_stack* stck, int conn_id) {
 			// Any other packet is responded to with a RST that we will not expect an ACK for.
 			else {
 				printf("RST'ing connection.\n");
-				tcp_send_rst(stck, conn_id, !(tcp_head->flags & MIU_TCP_ACK), ntohl(tcp_head->acknowledgement_number), ntohl(tcp_head->sequence_number) + data_len);
+				tcp_send_rst(stck, conn_id, ipv4_head);
+			}
+		}
+		// Check if we're in LISTEN.
+		else if (conn->state == MIU_TCPIP_LISTEN) {
+			printf("We're establishing connections from inbound SYNs\n");
+			// Check for RST flag.
+			if (tcp_head->flags & MIU_TCP_RST) {
+				printf("Packet has RST set, ignore.\n");
+				continue;
+			}
+			// Check the ACK flag.
+			if (tcp_head->flags & MIU_TCP_ACK) {
+				printf("Packet has ACK set, reseting peer.\n");
+				tcp_send_rst(stck, conn_id, ipv4_head);
+			}
+			// Check the SYN flag
+			if (tcp_head->flags & MIU_TCP_SYN) {
+				// Initiate connection
+				conn->RCV_NXT = ntohl(tcp_head->sequence_number) + 1;
+				conn->IRS = ntohl(tcp_head->sequence_number);
+				
+				// Create and send SYN-ACK
+				uint8_t buf[40];
+				gen_ipv4_hdr((struct ipv4_hdr*) buf, 20, IPPROTO_TCP, conn->locl_ipv4, conn->peer_ipv4);
+				gen_tcp_hdr((struct tcp_hdr*) (buf+20), ntohs(conn->locl_port), ntohs(conn->peer_port), MIU_TCP_SYN | MIU_TCP_ACK, conn->ISS, conn->RCV_NXT, 512, conn->locl_ipv4, conn->peer_ipv4, 0, NULL);
+				
+				tcp_send_raw(stck, conn_id, buf, 40, 0);
 			}
 		}
 		// Check if we're in SYN_SENT.
@@ -526,7 +584,7 @@ int tcp_recv_packets(struct tcp_stack* stck, int conn_id) {
 			// If this packet ACK's our SYN
 			if (tcp_head->flags & MIU_TCP_ACK) {
 				// Check that the ACK is good.
-				if (tcp_head->acknowledgement_number <= conn->ISS || tcp_head->acknowledgement_number > conn->SND_NXT) {
+				if (ntohl(tcp_head->acknowledgement_number) <= conn->ISS || ntohl(tcp_head->acknowledgement_number) > conn->SND_NXT) {
 					printf("Acknowledgement is bad.\n");
 					if (tcp_head->flags & MIU_TCP_RST) {
 						printf("packet is RST, ignore.\n");
@@ -534,7 +592,7 @@ int tcp_recv_packets(struct tcp_stack* stck, int conn_id) {
 					}
 					else {
 						printf("RST'ing connection.\n");
-						tcp_send_rst(stck, conn_id, 0, 0, ntohl(tcp_head->sequence_number) + data_len);
+						tcp_send_rst(stck, conn_id, ipv4_head);
 						continue;
 					}
 				}
@@ -550,16 +608,16 @@ int tcp_recv_packets(struct tcp_stack* stck, int conn_id) {
 					}
 					
 					// Set TCB to reflect the ACK.
-					conn->SND_UNA = tcp_head->acknowledgement_number;
+					conn->SND_UNA = ntohl(tcp_head->acknowledgement_number);
 				}
 			}
 			// At this point, the packet either contains a good ACK or no ACK at all.
 			// Check if this is a SYN.
 			if (tcp_head->flags & MIU_TCP_SYN) {
 				// Update the TCB based on this SYN
-				conn->IRS = tcp_head->sequence_number;
-				conn->RCV_NXT = tcp_head->sequence_number + 1;
-				conn->RCV_WND = tcp_head->window_size;
+				conn->IRS = ntohl(tcp_head->sequence_number);
+				conn->RCV_NXT = ntohl(tcp_head->sequence_number) + 1;
+				conn->RCV_WND = ntohs(tcp_head->window_size);
 				
 				// Check if we have also received an ACK. If so, connection is established.
 				if (tcp_head->flags & MIU_TCP_ACK) {
@@ -568,9 +626,10 @@ int tcp_recv_packets(struct tcp_stack* stck, int conn_id) {
 					// ACK this SYN.
 					uint8_t buf[40];
 					gen_ipv4_hdr((struct ipv4_hdr*) buf, 20, IPPROTO_TCP, conn->locl_ipv4, conn->peer_ipv4);
-					gen_tcp_hdr((struct tcp_hdr*) (buf+20), conn->locl_ipv4, conn->peer_ipv4, MIU_TCP_ACK, conn->SND_NXT, conn->RCV_NXT, htons(512), conn->locl_ipv4, conn->peer_ipv4, 0, NULL);
-				
-					tcp_send_raw(stck, conn_id, buf, 40);
+					gen_tcp_hdr((struct tcp_hdr*) (buf+20), ntohs(conn->locl_port), ntohs(conn->peer_port), MIU_TCP_ACK, conn->SND_NXT, conn->RCV_NXT, 512, conn->locl_ipv4, conn->peer_ipv4, 0, NULL);
+					
+					printf("ACK'ing SYN-ACK.\n");
+					tcp_send_raw(stck, conn_id, buf, 40, 0);
 					continue;
 				}
 				// Otherwise, initiate simultaneous connection
@@ -580,9 +639,10 @@ int tcp_recv_packets(struct tcp_stack* stck, int conn_id) {
 					// Send SYN-ACK
 					uint8_t buf[40];
 					gen_ipv4_hdr((struct ipv4_hdr*) buf, 20, IPPROTO_TCP, conn->locl_ipv4, conn->peer_ipv4);
-					gen_tcp_hdr((struct tcp_hdr*) (buf+20), conn->locl_ipv4, conn->peer_ipv4, MIU_TCP_SYN | MIU_TCP_ACK, conn->ISS, conn->RCV_NXT, htons(512), conn->locl_ipv4, conn->peer_ipv4, 0, NULL);
-				
-					tcp_send_raw(stck, conn_id, buf, 40);
+					gen_tcp_hdr((struct tcp_hdr*) (buf+20), htons(conn->locl_port), htons(conn->peer_port), MIU_TCP_SYN | MIU_TCP_ACK, conn->ISS, conn->RCV_NXT, 512, conn->locl_ipv4, conn->peer_ipv4, 0, NULL);
+					
+					printf("Sending Simu. SYN-ACK.\n");
+					tcp_send_raw(stck, conn_id, buf, 40, 0);
 					continue;
 				}
 			}
@@ -590,9 +650,80 @@ int tcp_recv_packets(struct tcp_stack* stck, int conn_id) {
 	}
 }
 
+// Repeatedly checks the first item on the retransmission queue. If it has been ACK'd, remove it.
+// If its retransmission time has passed, and its max retransmission attempts has not been reached, retransmit it
+// and move it to the back of the queue.
+// If its retransmission time has been reached and its max attempts has been reached, assume the connection has been partitioned and reset.
+// This function returns when no items are left on the retransmission queue for which action is required.
+void tcp_check_retransmissions(struct tcp_stack* stck, int conn_id) {
+	struct tcp_tcb* conn = stck->connections[conn_id];
+	
+	while (1) {
+		if (conn->retrans == NULL) {
+			return;
+		}
+		
+		// Check if the packet is fully acknowledged
+		if (conn->SND_UNA > conn->retrans->last_oc) {
+			free(conn->retrans->packet);
+			struct tcp_retrans_q* temp = conn->retrans->next;
+			free(conn->retrans);
+			conn->retrans = temp;
+			
+			continue;
+		}
+		
+		// Check if the retransmit time is exceeded.
+		if (time(NULL) > conn->retrans->retransmit_time) {
+			// Check if the retransmit attempts have been exceeded
+			if (conn->retrans->retrans_attempts == MIU_TCPIP_RETRANS_ATTEMPTS) {
+				tcp_reset_connection(stck, conn_id);
+				conn->state = MIU_TCPIP_DISCON_TMO;
+				return;
+			}
+			
+			// Otherwise, retransmit this packet and queue it for retransmission.
+			tcp_send_raw(stck, conn_id, conn->retrans->packet, conn->retrans->packet_n, 1);
+			
+			// send_raw will have queued the packet. Now we just set its attempts and delete this packet
+			conn->last_retrans->retrans_attempts = conn->retrans->retrans_attempts + 1;
+			conn->last_retrans->last_oc = conn->retrans->last_oc;
+			
+			free(conn->retrans->packet);
+			struct tcp_retrans_q* temp = conn->retrans->next;
+			free(conn->retrans);
+			conn->retrans = temp;
+			
+			continue;
+		}
+		
+		// The next retransmission queue item requires no action, return.
+		return;
+	}
+}
+
 // Sends a FIN packet, and sets the TCB fin-tracking variables.
 // When the FIN is ACK'd, move from ESTABLISHED to FIN_SENT or from FIN_RECV to FIN_SNRC
-int tcp_disconnect(
+int tcp_disconnect(struct tcp_stack* stck, int conn_id) {
+	int err;
+	
+	struct tcp_tcb* conn = stck->connections[conn_id];
+	
+	// Create a buffer to send data from and put a FIN packet in it.
+	uint8_t buf[40];
+	
+	gen_ipv4_hdr((struct ipv4_hdr*) buf, 20, IPPROTO_TCP, conn->locl_ipv4, conn->peer_ipv4);
+	gen_tcp_hdr((struct tcp_hdr*) (buf+20), ntohs(conn->locl_port), ntohs(conn->peer_port), MIU_TCP_FIN | MIU_TCP_ACK, conn->SND_NXT, conn->RCV_NXT, 512, conn->locl_ipv4, conn->peer_ipv4, 0, NULL);
+	
+	conn->locl_has_sent_fin = 1;
+	conn->locl_fin_SEQ = conn->SND_NXT;
+	
+	// Send FIN
+	printf("Sending FIN.\n");
+	err = tcp_send_raw(stck, conn_id, buf, 40, 0);
+	if (err != MIU_TCPIP_SUCCESS) return err;
+}
+	
 
 // Deletes a connection. Frees all malloc'd memory that may be used by the retransmission or msg queues, and frees the TCB.
 // This will not gracefully close the connection if it is open. The connection should be closed separately via tcp_disconnect().

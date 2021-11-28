@@ -6,13 +6,13 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 
-/* Starts a passive TCP server listening on 127.0.0.3:240 */
+/* Starts a passive TCP server listening on 127.0.0.2:2400 */
 
 int main() {
 	int err;
 	
-	struct sockaddr_in cli = {PF_INET, htons(19000), inet_addr("127.0.0.2")};
-	struct sockaddr_in srv = {PF_INET, htons(18000), inet_addr("127.0.0.3")};
+	struct sockaddr_in cli = {PF_INET, htons(1200), inet_addr("127.0.0.3")};
+	struct sockaddr_in srv = {PF_INET, htons(2400), inet_addr("127.0.0.2")};
 	
 	int sok = socket(PF_INET, SOCK_STREAM, IPPROTO_TCP);
 	if (sok == -1) perror("Failed to get socket descriptor");

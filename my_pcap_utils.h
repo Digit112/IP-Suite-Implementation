@@ -1,3 +1,4 @@
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <time.h>
@@ -33,7 +34,7 @@ void end_cap(pcap_t* pcap_handle, const char* fn) {
 	float st = (float) clock() / CLOCKS_PER_SEC;
 	while ((float) clock() / CLOCKS_PER_SEC - 0.2 < st) {}
 	
-	struct pcap_pkthdr* pkt_hdr = malloc(sizeof(struct pcap_pkthdr));
+	struct pcap_pkthdr* pkt_hdr = (struct pcap_pkthdr*) malloc(sizeof(struct pcap_pkthdr));
 	const uint8_t* pkt_data = NULL;
 	
 	pcap_dumper_t* pcap_fout = pcap_dump_open(pcap_handle, fn);

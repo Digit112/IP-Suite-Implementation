@@ -12,13 +12,13 @@
 int main() {
 	int err;
 	
-	uint32_t cli_addr = inet_addr("127.0.0.2");
-	uint32_t srv_addr = inet_addr("127.0.0.3");
+	uint32_t cli_addr = inet_addr("127.0.0.3");
+	uint32_t srv_addr = inet_addr("127.0.0.2");
 	
 	struct sockaddr_in cli = {AF_INET, 0, cli_addr};
 	struct sockaddr_in srv = {AF_INET, 0, srv_addr};
 	
-	int sok = socket(PF_INET, SOCK_RAW, 4);
+	int sok = socket(AF_INET, SOCK_RAW, 4);
 	if (sok == -1) perror("Failed to get socket descriptor");
 	
 	err = bind(sok, (struct sockaddr*) &cli, sizeof(cli));

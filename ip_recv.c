@@ -5,12 +5,12 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 
-/* Waits for an IP datagram addressed to 127.0.0.1 and extracts the data. */
+/* Waits for an IP datagram addressed to "to" and extracts the data. */
 
 int main() {
 	int err;
 	
-	struct sockaddr_in to = {PF_INET, 0, inet_addr("127.0.0.3")};
+	struct sockaddr_in to = {PF_INET, 0, inet_addr("127.0.0.2")};
 	
 	int sok = socket(PF_INET, SOCK_RAW, 4);
 	if (sok == -1) perror("Failed to get socket descriptor");
