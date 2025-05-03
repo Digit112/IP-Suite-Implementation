@@ -1,7 +1,5 @@
-# My IP Suite Implementation
-## This implementation sucks!
-It does not come close to strictly enforcing the protocols it implements, and often leaves out features they provide, (For example, DiffServ in IPv4 and the Security/Precedence functionality of TCP). Furthermore, the code is haphazard, relatively patched-together and not 100% consistent in its design philosophy.
+# My TCP/IP Implementation
+### This implementation sucks!
+It does not come close to strictly enforcing the protocols it implements, and often leaves out features they provide, (For example, DiffServ in IPv4 and the Security/Precedence functionality of TCP). Most importantly, it was not informed in any way by the many revisions and extensions that would later supplement the original standards. Nonetheless, it does successfully exchange data with other real-world RCP implementations. In particular, it was tested against the TCP/IP implementation in Linux.
 
-So you may be wondering, What's this guy's deal? Well, this is an academic exercise, I only wish to learn how these protocols work, and have no desire to see these implementations used in the wild. If my implementations can interact, on at least a minimal level, with real-world implementations successfully (grab a webpage, perform a successful SSH authentication) then I'll have succeeded in my goal. Maybe some time in the future I'll make a nice, well-documented, polished implementation. Probably not though.
-
-I saw no reason this repository should be private, so it's not.
+This is a purely academic exercise, I only wish to learn how these protocols work, and have no desire to see these implementations used in the wild. If my implementations can interact, on at least a minimal level, with real-world implementations successfully (grab a webpage, perform a successful SSH authentication) then I'll have succeeded in my goal. Maybe some time in the future I'll add additional IP suite protocols and make a much better, polished implementation.
